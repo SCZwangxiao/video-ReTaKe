@@ -1,8 +1,9 @@
 ### model
 method: retake
 scaling_factor: 4
+attn_implementation: "eager" # NPU does not support sdpa attention now
 longvideo_kwargs: {
-  'frame_chunk_size': 32, # Trade-off beteen peak memory and speed
+  'frame_chunk_size': 16, # Trade-off beteen peak memory and speed
   'chunked_prefill_frames': 16, # Trade-off beteen peak memory and speed
   # Keyframe compression
   'visual_compression': True,

@@ -1,4 +1,5 @@
 import math
+from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -37,6 +38,7 @@ if is_flash_attn_2_available():
 else:
     flash_attn_varlen_func = None
 
+DEBUG_MODE = False
 
 logger = logging.get_logger(__name__)
 
@@ -766,8 +768,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         past_key_values.kvcache_compression = kvcache_compression
         if keypatches_mask is not None:
             assert keypatches_mask.shape[0] == inputs_embeds.shape[1] - s_index
-        for idx in range(num_chunks):
-            print("Prefilling chunk %d/%d" % (idx + 1, num_chunks))
+        for idx in tqdm(range(num_chunks), total=num_chunks, desc='Prefilling chunk', disable=not DEBUG_MODE):
             s, e = s_index + idx * chunk_size , s_index + (idx + 1) * chunk_size
             position_ids_chunk = position_ids[:,:,s:e]
             attention_mask_chunk = attention_mask[:,:e]

@@ -1,6 +1,11 @@
 # Prepare environment
 ```bash
+# For GPU users
 conda env create -f environment.yaml
+
+# For NPU users
+# conda env create -f environment_npu.yaml
+
 apt-get install ffmpeg # NOTE: Quick demo does not require ffmpeg
 ```
 
