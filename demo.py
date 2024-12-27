@@ -10,6 +10,7 @@ import numpy as np
 from torchvision.transforms.functional import pil_to_tensor
 from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration, AutoProcessor
 
+import retake
 from retake.monkeypatch import patch_qwen2vl, patch_qwen2vl_config
 
 
@@ -117,7 +118,7 @@ def fetch_video(video_info, max_num_frames, sample_fps, longsize_resolution):
     return frames
 
 
-def load_model(hf_qwen2vl7b_path, exp_configs):
+def load_model(hf_qwen2vl7b_path, exp_configs, device):
     qwen2vl_config = Qwen2VLConfig.from_pretrained(hf_qwen2vl7b_path)
     qwen2vl_config = patch_qwen2vl_config(qwen2vl_config, exp_configs)
     model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -131,7 +132,7 @@ def load_model(hf_qwen2vl7b_path, exp_configs):
     return model, processor
 
 
-DEMO_VIDEO = 'misc/Q8AZ16uBQ8AZ16uBhr8_resized_fps2_mutehr8_resized_fps2.mp4'
+DEMO_VIDEO = 'misc/Q8AZ16uBhr8_resized_fps2_mute.mp4'
 DEMO_QUESTIONS = [
     "As depicted in the video, how is the relationship between the rabbit and human?\nOptions:\nA. Hostile.\nB. Friend.\nC. Cooperator.\nD. No one is correct above.\nAnswer with the option's letter from the given choices directly.",
     "What is the impression of the video?\nOptions:\nA. Sad.\nB. Funny.\nC. Horrible.\nD. Silent.\nAnswer with the option's letter from the given choices directly.",
@@ -143,11 +144,17 @@ EXPECTED_ANSWERS = ['A', 'B', 'C']
 if __name__ == "__main__":
     #------------------- Modify the following configs ------------------#
     hf_qwen2vl7b_path = 'Qwen/Qwen2-VL-7B-Instruct' # TODO: replace to local path if you have trouble downloading huggingface models
-    config_path = 'configs/retake_demo.yaml' # NOTE: for Nvidia GPUs
-    # config_path = 'configs/retake_demo_npu.yaml' # NOTE: for NPUs or GPUs without support for FlashAttention
+    
+    # NOTE: for Nvidia GPUs
+    config_path = 'configs/retake_demo.yaml'
+    device = 'cuda:0'
+
+    # NOTE: for NPUs or GPUs without support for FlashAttention
+    # config_path = 'configs/retake_demo_npu.yaml'
+    # device = 'npu:0'
 
     #------------------------ No need to change ------------------------#
-    device = 'cuda:0'
+    retake.qwen2_vl.DEBUG_MODE = True
     video_info = {"type": "video", 
                   "video": DEMO_VIDEO, 
                   "fps": 2.0}
@@ -155,7 +162,7 @@ if __name__ == "__main__":
     exp_configs = load_yaml(config_path)
     patch_qwen2vl(exp_configs['method']) # Replace some functions of QWen2VL with those from ReTaKe
 
-    model, processor = load_model(hf_qwen2vl7b_path, exp_configs)
+    model, processor = load_model(hf_qwen2vl7b_path, exp_configs, device)
 
     # Video
     video = fetch_video(video_info, exp_configs['max_num_frames'], exp_configs['sample_fps'], exp_configs['longsize_resolution'])
@@ -175,7 +182,7 @@ if __name__ == "__main__":
         print('Input prompt:\n', text_prompt)
 
         inputs = processor(text=[text_prompt], videos=[video], padding=True, return_tensors="pt")
-        inputs = inputs.to('cuda')
+        inputs = inputs.to(device)
 
         # Inference: Generation of the output
         output_ids = model.generate(**inputs, do_sample=False, max_new_tokens=128)
