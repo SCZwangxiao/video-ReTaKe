@@ -424,7 +424,7 @@ def retake_Qwen2VLForConditionalGeneration_prepare_longvideo_prefill(
     # Calculate compression_ratio for dynamic compression
     if getattr(config, 'longvideo_kwargs', None) and config.longvideo_kwargs.get('kvcache_compression', False):
         compression_kwargs = config.longvideo_kwargs['kvcache_compression_kwargs']
-        if compression_kwargs.get('dynamic_compression_ratio', True):
+        if compression_kwargs.get('dynamic_compression_ratio', False):
             # Dynamic compression ratio
             input_length = input_ids.shape[1]
             max_input_length = compression_kwargs['max_input_length']

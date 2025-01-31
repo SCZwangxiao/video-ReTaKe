@@ -25,7 +25,14 @@ apt-get install ffmpeg # NOTE: Quick demo does not require ffmpeg
 - Step 1:
 Change `hf_qwen2vl7b_path` in `./demo.py` into your path to `Qwen2-VL-7B-Instruct`. Note that for NPU users, you need also change `config_path` into `'configs/retake_demo_npu.yaml'`.
 
-- Step 2:
+- Step 2 (optional for LLaVA-Video):
+```bash
+# Convert LLaVA-Video model into huggingface format
+# `Qwen2-7B-Instruct`, `siglip-so400m-patch14-384`, and `LLaVAVideoQwen2_7B` are downloadable models from huggingface.
+python scripts/utils/convert_llava_video_weights_to_hf.py --text_model_id /path_to/Qwen2-7B-Instruct --vision_model_id /path_to/siglip-so400m-patch14-384 --output_hub_path /path_to/llava-video-qwen2-7b-hf --old_state_dict_id /path_to/LLaVAVideoQwen2_7B
+```
+
+- Step 3:
 Run demo
 ```bash
 python demo.py
@@ -38,8 +45,8 @@ python demo.py
   - Prepare [LVBench](docs/prepare_lvbench.md)
 - Run script
 ```bash
-bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/retake_videomme.yaml 8
-bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/retake_mlvu.yaml 8
-bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/retake_lvbench.yaml 8
+bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/qwen2_vl/retake_qwen2-vl_videomme.yaml 8
+bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/qwen2_vl/retake_qwen2-vl_mlvu.yaml 8
+bash scripts/infer_eval_retake.sh ${YOUR_PATH_TO_Qwen2-VL-7B-Instruct} configs/qwen2_vl/retake_qwen2-vl_lvbench.yaml 8
 ```
 The above script perform inference and evaluation all in one. Results can be found in `./results`

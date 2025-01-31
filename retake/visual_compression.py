@@ -110,16 +110,22 @@ def memory_bank_compress_keyframe(memory_bank: torch.Tensor, tgt_mem_len: int, w
         keypatches_mask = torch.zeros_like(dis_matrix).bool()
 
         # Argrelmax
-        if torch.npu.is_available():
-            # F.max_pool1d_with_indices is not supported and returns wrong tensor
-            device = dis_matrix.device
-            dis_matrix = dis_matrix.cpu()
+        try:
+            if torch.npu.is_available():
+                # F.max_pool1d_with_indices is not supported and returns wrong tensor
+                device = dis_matrix.device
+                dis_matrix = dis_matrix.cpu()
+        except:
+            pass
         window_maxima = F.max_pool1d_with_indices(dis_matrix[None,None,:], window_size, 1, padding=window_size//2)[1].squeeze() # [T]
         candidates = window_maxima.unique()
         peaks = candidates[(window_maxima[candidates]==candidates).nonzero()].squeeze()
-        if torch.npu.is_available():
-            dis_matrix = dis_matrix.to(device)
-            peaks = peaks.to(device)
+        try:
+            if torch.npu.is_available():
+                dis_matrix = dis_matrix.to(device)
+                peaks = peaks.to(device)
+        except:
+            pass
 
         # Fill remaining frames
         keypatches_mask[peaks] = True
@@ -135,11 +141,14 @@ def memory_bank_compress_keyframe(memory_bank: torch.Tensor, tgt_mem_len: int, w
         dis_matrix = dis_matrix.transpose(0, 1) # [N, T]
         keypatches_mask = torch.zeros_like(dis_matrix).bool()
         # Argrelmax
-        if torch.npu.is_available():
-            # F.max_pool1d_with_indices is not supported and returns wrong tensor
-            device = dis_matrix.device
-            dis_matrix = dis_matrix.cpu()
-            keypatches_mask = keypatches_mask.cpu()
+        try:
+            if torch.npu.is_available():
+                # F.max_pool1d_with_indices is not supported and returns wrong tensor
+                device = dis_matrix.device
+                dis_matrix = dis_matrix.cpu()
+                keypatches_mask = keypatches_mask.cpu()
+        except:
+            pass
         window_maxima = F.max_pool1d_with_indices(dis_matrix[:,None,:], window_size, 1, padding=window_size//2)[1].squeeze() # [N, T]
         for p, window_maxima_patch in enumerate(window_maxima):
             candidates_patch = window_maxima_patch.unique()
@@ -148,9 +157,12 @@ def memory_bank_compress_keyframe(memory_bank: torch.Tensor, tgt_mem_len: int, w
             # Fill remaining frames
             keypatches_mask[p, peaks_patch] = True
             dis_matrix[p, peaks_patch] += 2
-        if torch.npu.is_available():
-            dis_matrix = dis_matrix.to(device)
-            keypatches_mask = keypatches_mask.to(device)
+        try:
+            if torch.npu.is_available():
+                dis_matrix = dis_matrix.to(device)
+                keypatches_mask = keypatches_mask.to(device)
+        except:
+            pass
         peaks = torch.topk(dis_matrix, k=tgt_mem_len, sorted=False, dim=1)[1] # [N, t]
         peaks = peaks.sort(dim=1)[0]
         peaks = peaks.transpose(0, 1) # [t, N]

@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Subset
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor
 
 from retake.monkeypatch import patch_qwen2vl, patch_qwen2vl_config
 from retake.dataset_utils import get_dataset, get_eval_methods
@@ -37,31 +37,57 @@ def trimm_results(s):
     for answer_prefix in answer_prefixes:
         s = s.replace(answer_prefix, "")
 
-    if len(s.split()) > 10 and not re.search("[ABCD]", s):
+    if len(s.split()) > 10 and not re.search("[ABCDEFG]", s):
         return ""
 
-    matches = re.search(r"[ABCD]", s)
+    matches = re.search(r"[ABCDEFG]", s)
     if matches is None:
         return ""
     return matches[0]
 
 
 class InferClient:
-    def __init__(self, hf_qwen2vl7b_path, exp_configs, device) -> None:
+    def __init__(self, model_name, hf_model_path, exp_configs, device) -> None:
         self.device = device
+        self.model_name = model_name if model_name is not None else exp_configs['model_name']
         self.do_sample = exp_configs.get('do_sample', False)
-        self.load_model(hf_qwen2vl7b_path, exp_configs, device)
+        self.load_model(model_name, hf_model_path, exp_configs, device)
 
-    def load_model(self, hf_qwen2vl7b_path, exp_configs, device):
-        qwen2vl_config = Qwen2VLConfig.from_pretrained(hf_qwen2vl7b_path)
-        qwen2vl_config = patch_qwen2vl_config(qwen2vl_config, exp_configs)
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            hf_qwen2vl7b_path,
-            config=qwen2vl_config,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2"
-        ).to(device).eval()
-        self.processor = AutoProcessor.from_pretrained(hf_qwen2vl7b_path)
+    def load_model(self, model_name, hf_model_path, exp_configs, device):
+        model_name = model_name if model_name is not None else exp_configs['model_name']
+        model_name = model_name.lower().replace('-', '').replace('_', '')
+        if model_name == 'qwen2vl': # QWen2VL
+            from transformers import Qwen2VLConfig, Qwen2VLForConditionalGeneration
+            from retake.monkeypatch import patch_qwen2vl, patch_qwen2vl_config
+            patch_qwen2vl(exp_configs['method']) # Replace some functions of QWen2VL with those from ReTaKe
+            qwen2vl_config = Qwen2VLConfig.from_pretrained(hf_model_path)
+            qwen2vl_config = patch_qwen2vl_config(qwen2vl_config, exp_configs)
+            model = Qwen2VLForConditionalGeneration.from_pretrained(
+                hf_model_path,
+                config=qwen2vl_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=exp_configs.get('attn_implementation', None),
+                device_map=device # "auto"
+            ).eval()
+            processor = AutoProcessor.from_pretrained(hf_model_path)
+        elif model_name in ['llavaonevision', 'llavavideo']: # LLaVA-OneVision, LLaVA-Video
+            from transformers import LlavaOnevisionConfig, LlavaOnevisionForConditionalGeneration
+            from retake.monkeypatch import patch_llava_onevision, patch_llava_onevision_config
+            patch_llava_onevision(exp_configs['method']) # Replace some functions of LLaVA-Video with those from ReTaKe
+            llava_onevision_config = LlavaOnevisionConfig.from_pretrained(hf_model_path)
+            llava_onevision_config = patch_llava_onevision_config(llava_onevision_config, exp_configs)
+            processor = AutoProcessor.from_pretrained(hf_model_path) 
+            model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+                hf_model_path, 
+                config=llava_onevision_config,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=exp_configs.get('attn_implementation', None),
+                device_map=device # "auto"
+            ) 
+        else:
+            raise NotImplementedError
+        self.model = model
+        self.processor = processor
 
     def infer(self, message):
         # Prepare inputs
@@ -78,6 +104,7 @@ class InferClient:
         text_prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
         inputs = self.processor(text=[text_prompt], videos=[video], padding=True, return_tensors="pt")
         inputs = inputs.to(self.device)
+        inputs['pixel_values_videos'] = inputs['pixel_values_videos'].to(torch.bfloat16)
 
         # Inference
         output_ids = self.model.generate(**inputs, do_sample=self.do_sample, max_new_tokens=128)
@@ -91,10 +118,14 @@ class InferClient:
 def parse_arguments():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="ReTaKe Evaluation")
-    parser.add_argument('--hf_qwen2vl7b_path', 
+    parser.add_argument('--model_name', 
+                        type=str, 
+                        help="Modelname")
+    parser.add_argument('--hf_path',
+                        '--hf_qwen2vl7b_path', 
                         type=str, 
                         default='Qwen/Qwen2-VL-7B-Instruct', 
-                        help="Path to the experimental config")
+                        help="Path to the huggingface model")
     parser.add_argument('--config_path', 
                         type=str, 
                         default='configs/retake_videomme.yaml', 
@@ -131,9 +162,8 @@ def main(rank, world_size, args):
     setup(rank, world_size, args.timeout)
 
     exp_configs = load_yaml(args.config_path)
-    patch_qwen2vl(exp_configs['method'])  # Replace some functions of QWen2VL with those from ReTaKe
 
-    client = InferClient(args.hf_qwen2vl7b_path, exp_configs, device)
+    client = InferClient(args.model_name, args.hf_path, exp_configs, device)
 
     dataset = get_dataset(
         dataset_name=exp_configs['dataset_name'],
@@ -147,14 +177,9 @@ def main(rank, world_size, args):
     )
 
     # Split dataset into shards
-    # shard_size = len(dataset) / world_size
-    # shard_start = rank * shard_size
-    # shard_end = shard_start + shard_size if rank != world_size - 1 else len(dataset)
-    # shard_dataset = Subset(dataset, range(round(shard_start), round(shard_end))) # round make sharding more even
     # Function to create a round-robin shard for a given rank
     indices = [i for i in range(len(dataset)) if i % world_size == rank]
     shard_dataset = Subset(dataset, indices)
-
 
     dataloader = DataLoader(shard_dataset, batch_size=None, num_workers=exp_configs['dataloader_num_workers'])
 

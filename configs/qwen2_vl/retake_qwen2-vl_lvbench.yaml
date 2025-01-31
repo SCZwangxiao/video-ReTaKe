@@ -5,6 +5,14 @@ attn_implementation: "flash_attention_2"
 longvideo_kwargs: {
   'frame_chunk_size': 128,
   'chunked_prefill_frames': 32,
+  # Keyframe compression
+  'visual_compression': True,
+  'visual_compression_kwargs': {
+    'compression_ratio': 1.0,
+    'compression_method': 'Keyframe',
+    'patch_sync': False,
+    'return_keyframe_mask': True
+  },
   # KVCache compression
   'kvcache_compression': True,
   'kvcache_compression_kwargs': {
@@ -15,14 +23,13 @@ longvideo_kwargs: {
   },
 }
 
-
 ### dataset
-dataset_name: videomme
-anno_file: dataset/video_mme/video_mme.json
+dataset_name: lvbench
+anno_file: dataset/lvbench/lvbench.json
 dataloader_num_workers: 2
 
 ### data
-sample_fps: 4
+sample_fps: 2
 max_num_frames: 2048
 longsize_resolution: 448
 
@@ -30,4 +37,4 @@ longsize_resolution: 448
 do_sample: false
 
 ### output
-output_dir: results/qwen2vl_7b_128k_video_mme_f2048_4fps_r448/retake_pivot-32k
+output_dir: results/qwen2vl_7b_lvbench_f2048_2fps_r448/retake_dp1-async_pivot-32k
