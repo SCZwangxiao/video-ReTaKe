@@ -1,4 +1,5 @@
 ### model
+model_name: qwen2_vl
 method: retake
 scaling_factor: 4
 attn_implementation: "flash_attention_2"
