@@ -51,7 +51,7 @@ def patch_llava_onevision_config(config, exp_configs):
 def patch_qwen2vl(method):
 
     if method == "retake":
-        print("Using ReTaKe!")
+        print("Using ReTaKe for Qwen2VLForConditionalGeneration!")
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLAttention.__init__ = retake_Qwen2VLAttention_init
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLAttention.forward = retake_Qwen2VLAttention_forward
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLSdpaAttention.forward = retake_Qwen2VLSdpaAttention_forward
@@ -68,7 +68,7 @@ def patch_qwen2vl(method):
 def patch_llava_onevision(method):
 
     if method == "retake":
-        print("Using ReTaKe!")
+        print("Using ReTaKe for LlavaOnevisionForConditionalGeneration!")
         transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = retake_Qwen2FlashAttention2_forward
         transformers.models.llava_onevision.modeling_llava_onevision.LlavaOnevisionForConditionalGeneration.get_chunk_size = retake_LlavaOnevisionForConditionalGeneration_get_chunk_size
         transformers.models.llava_onevision.modeling_llava_onevision.LlavaOnevisionForConditionalGeneration.segment_input_ids = retake_LlavaOnevisionForConditionalGeneration_segment_input_ids

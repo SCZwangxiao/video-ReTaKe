@@ -30,7 +30,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 
 from .visual_compression import *
-from .longvideo_cache_llava_onevision import *
+from .longvideo_cache import *
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
