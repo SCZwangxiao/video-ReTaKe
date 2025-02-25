@@ -509,12 +509,12 @@ def retake_Qwen2VLForConditionalGeneration_forge_input_chunks(self, ss, ee, moda
             else:
                 raise NotImplementedError
             assert t_p == 'text'
-            cache_position_chunk = cache_position[:ee+prompt_length]
             pos_offset = position_ids[0,0,s_p] - position_ids_chunk[0,0,-1] - 1 # (3, bs, seq_len)
             position_ids_chunk = torch.cat([position_ids_chunk, position_ids[:,:,s_p:e_p] - pos_offset], dim=2)
             attention_mask_chunk = torch.cat([attention_mask_chunk, attention_mask[:,s_p:e_p]], dim=1)
             inputs_embeds_chunk = torch.cat([inputs_embeds_chunk, inputs_embeds[:,s_p:e_p]], dim=1)
             prompt_length = e_p - s_p
+            cache_position_chunk = cache_position[:ee+prompt_length]
 
     return cache_position_chunk, position_ids_chunk, attention_mask_chunk, inputs_embeds_chunk, prompt_length
 
