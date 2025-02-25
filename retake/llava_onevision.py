@@ -11,9 +11,8 @@ from torch.nn import CrossEntropyLoss
 import numpy as np
 
 from transformers.cache_utils import Cache
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import GenerateOutput
-from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.processing_utils import Unpack
 from transformers.utils import (
     is_flash_attn_2_available,
     logging,
@@ -23,9 +22,11 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
     LlavaOnevisionCausalLMOutputWithPast,
     image_size_to_num_patches,
 )
-
 from transformers.models.qwen2.modeling_qwen2 import (
     repeat_kv,
+    eager_attention_forward,
+    Qwen2Attention,
+    Qwen2RotaryEmbedding,
     apply_rotary_pos_emb,
 )
 
@@ -35,7 +36,7 @@ from .longvideo_cache import *
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
 
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
+    from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 else:
     flash_attn_varlen_func = None
 
@@ -44,35 +45,41 @@ DEBUG_MODE = False
 logger = logging.get_logger(__name__)
 
 
-def retake_Qwen2FlashAttention2_forward(
+Qwen2Attention_original_init = Qwen2Attention.__init__
+
+def retake_Qwen2Attention_init(
+    self, 
+    config: Qwen2VLConfig, 
+    layer_idx: Optional[int] = None
+):
+    Qwen2Attention_original_init(self, config, layer_idx)
+    self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
+
+
+def retake_Qwen2Attention_forward(
     self,
     hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
     past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-):
-    bsz, q_len, _ = hidden_states.size()
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
-
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     # Update position_ids if positional embeddings are reforged
     if past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False):
         # This code reforge the `position_ids` of current chunk, 
         # the `position_ids` of previous chunks are reforged in KVCache.update()
+        position_ids = kwargs.get('position_ids')
         prev_tempo_idx = past_key_value.get_prev_temporal_idx(self.layer_idx)
         cur_tempo_idx = position_ids[0,0]
         if prev_tempo_idx + 1 != cur_tempo_idx:
-            assert bsz == 1
             # print("Warning! Discontinuous positional ids %d (prev) + 1 != %d (cur) at layer %d. Fixed!" % (prev_tempo_idx,  cur_tempo_idx, self.layer_idx))
             # NOTE: clone `position_ids` to avoid influence of in-place ops in different layers
             position_ids = position_ids.clone()
@@ -89,103 +96,48 @@ def retake_Qwen2FlashAttention2_forward(
         cos, sin = self.rotary_emb(value_states, position_ids)
     else:
         cos, sin = position_embeddings
-
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
     if past_key_value is not None:
-        # Activate slicing cache only if the config has a value `sliding_windows` attribute
-        cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-        kv_seq_len = key_states.shape[-2] + cache_position[0]
-        if (
-            getattr(self.config, "sliding_window", None) is not None
-            and kv_seq_len > self.config.sliding_window
-            and cache_has_contents
-        ):
-            slicing_tokens = 1 - self.config.sliding_window
-
-            past_key = past_key_value[self.layer_idx][0]
-            past_value = past_key_value[self.layer_idx][1]
-
-            past_key = past_key[:, :, slicing_tokens:, :].contiguous()
-            past_value = past_value[:, :, slicing_tokens:, :].contiguous()
-
-            if past_key.shape[-2] != self.config.sliding_window - 1:
-                raise ValueError(
-                    f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
-                    f" {past_key.shape}"
-                )
-
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, slicing_tokens:]
-                attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
-
-        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+        # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         # Specific to KVCache compression methods
         cache_kwargs.update({"query_states": query_states, "position_ids": position_ids, "rotary_emb": self.rotary_emb})
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # repeat k/v heads if n_kv_heads < n_heads
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
-    dropout_rate = 0.0 if not self.training else self.attention_dropout
-
-    # In PEFT, usually we cast the layer norms in float32 for training stability reasons
-    # therefore the input hidden states gets silently casted in float32. Hence, we need
-    # cast them back in float16 just to be sure everything works as expected.
-    input_dtype = query_states.dtype
-    if input_dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
-        # Handle the case where the model is quantized
-        elif hasattr(self.config, "_pre_quantization_dtype"):
-            target_dtype = self.config._pre_quantization_dtype
-        else:
-            target_dtype = self.q_proj.weight.dtype
-
-        logger.warning_once(
-            f"The input hidden states seems to be silently casted in float32, this might be related to"
-            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-            f" {target_dtype}."
-        )
-
-        query_states = query_states.to(target_dtype)
-        key_states = key_states.to(target_dtype)
-        value_states = value_states.to(target_dtype)
-
-    # Reashape to the expected shape for Flash Attention
-    query_states = query_states.transpose(1, 2)
-    key_states = key_states.transpose(1, 2)
-    value_states = value_states.transpose(1, 2)
-
+    sliding_window = None
     if (
         self.config.use_sliding_window
         and getattr(self.config, "sliding_window", None) is not None
         and self.layer_idx >= self.config.max_window_layers
     ):
         sliding_window = self.config.sliding_window
-    else:
-        sliding_window = None
 
-    attn_output = _flash_attention_forward(
+    attention_interface: Callable = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+            logger.warning_once(
+                "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+        else:
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+    attn_output, attn_weights = attention_interface(
+        self,
         query_states,
         key_states,
         value_states,
         attention_mask,
-        q_len,
-        position_ids=position_ids,
-        dropout=dropout_rate,
-        sliding_window=sliding_window,
-        is_causal=self.is_causal,
-        use_top_left_mask=self._flash_attn_uses_top_left_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=sliding_window,  # main diff with Llama
+        **kwargs,
     )
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
-
-    if not output_attentions:
-        attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
+    return attn_output, attn_weights
 
 
 def retake_LlavaOnevisionForConditionalGeneration_get_chunk_size(
@@ -304,11 +256,11 @@ def retake_LlavaOnevisionForConditionalGeneration_compress_video_tokens(
             ],
             dim=1)
         num_token_diff = ori_seq_len - input_ids.shape[1]
-        if attention_mask is not None:
+        if num_token_diff and attention_mask is not None:
             attention_mask = attention_mask[:, num_token_diff:]
-        if position_ids is not None:
+        if num_token_diff and position_ids is not None:
             position_ids = position_ids[:,:-num_token_diff]
-        if cache_position is not None:
+        if num_token_diff and cache_position is not None:
             cache_position = cache_position[:-num_token_diff]
     else:
         keypatches_mask = None
@@ -370,7 +322,7 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
     output_hidden_states: Optional[bool] = None,
     return_dict: Optional[bool] = None,
     cache_position: Optional[torch.LongTensor] = None,
-    num_logits_to_keep: int = 0,
+    logits_to_keep: Union[int, torch.Tensor] = 0,
 ) -> Union[Tuple, LlavaOnevisionCausalLMOutputWithPast]:
     assert input_ids.shape[0] == 1, "Batch inference of long video is not supported yet!"
 
@@ -529,6 +481,8 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
         )
         video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(special_video_mask, video_features)
+        if keypatches_mask is not None:
+            keypatches_mask = torch.zeros_like(input_ids).bool().masked_scatter(special_video_mask[:,:,0], keypatches_mask)
 
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
@@ -546,7 +500,7 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
                     output_hidden_states=output_hidden_states,
                     return_dict=return_dict,
                     cache_position=cache_position[:e],
-                    num_logits_to_keep=num_logits_to_keep,
+                    logits_to_keep=logits_to_keep,
                 )
                 past_key_values = outputs['past_key_values']
             elif dtype == 'video': # Prefill video may with kvcache_compression
@@ -556,7 +510,7 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
                     ss = s + idx * chunk_size
                     ee = min(s + (idx + 1) * chunk_size, e)
                     if keypatches_mask is not None:
-                        past_key_values.keypatches_mask_chunk = keypatches_mask[ss:ee]
+                        past_key_values.keypatches_mask_chunk = keypatches_mask[0, ss:ee]
                     position_ids_chunk, cache_position_chunk, attention_mask_chunk, inputs_embeds_chunk, prompt_length = self.forge_input_chunks(
                         ss, ee, modality_segments, position_ids, cache_position, attention_mask, past_key_values, inputs_embeds
                     )
@@ -572,12 +526,12 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
                         output_hidden_states=output_hidden_states,
                         return_dict=return_dict,
                         cache_position=cache_position_chunk,
-                        num_logits_to_keep=num_logits_to_keep,
+                        logits_to_keep=logits_to_keep,
                     )
                     past_key_values = outputs['past_key_values']
                     if hasattr(past_key_values, 'after_forward'):
                         past_key_values.after_forward()
-                past_key_values.keypatches_mask = None
+                past_key_values.keypatches_mask_chunk = None
                 past_key_values.kvcache_compression = False # Turned off for decoding
             else:
                 raise ValueError
@@ -592,7 +546,7 @@ def retake_LlavaOnevisionForConditionalGeneration_forward(
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            num_logits_to_keep=num_logits_to_keep,
+            logits_to_keep=logits_to_keep,
         )
 
     logits = outputs[0]

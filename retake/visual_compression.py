@@ -93,6 +93,7 @@ def memory_bank_compress_keyframe(memory_bank: torch.Tensor, tgt_mem_len: int, w
     
     Returns:
         compressed_memory_bank (torch.Tensor): The compressed memory bank. Shape: (B, T-1, N, C)
+        keypatches_mask (torch.Tensor): The compressed memory bank. Shape: (T-1 * N)
     """
     B, T, N, C = memory_bank.shape
     # Calculate the cosine similarity between adjacent frames

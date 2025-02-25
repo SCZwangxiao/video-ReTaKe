@@ -8,20 +8,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.nn import CrossEntropyLoss
+import numpy as np
 
 from transformers.cache_utils import Cache
-from transformers.generation import GenerationMixin, GenerationConfig, LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import GenerateOutput
-from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import (
     is_flash_attn_2_available,
     logging,
 )
 from transformers import Qwen2VLConfig
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
-    Qwen2VLAttention, 
     Qwen2VLSdpaAttention,
-    Qwen2VLRotaryEmbedding,
     Qwen2VLCausalLMOutputWithPast,
     Qwen2VLForConditionalGeneration,
     repeat_kv,
@@ -41,47 +37,6 @@ else:
 DEBUG_MODE = False
 
 logger = logging.get_logger(__name__)
-
-
-def retake_Qwen2VLAttention_init(
-    self, 
-    config: Qwen2VLConfig, 
-    layer_idx: Optional[int] = None
-):
-    super(Qwen2VLAttention, self).__init__()
-    self.config = config
-    self.layer_idx = layer_idx
-    if layer_idx is None:
-        logger.warning_once(
-            f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-            "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-            "when creating this class."
-        )
-
-    self.hidden_size = config.hidden_size
-    self.num_heads = config.num_attention_heads
-    self.head_dim = self.hidden_size // self.num_heads
-    self.num_key_value_heads = config.num_key_value_heads
-    self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-    self.max_position_embeddings = config.max_position_embeddings
-    self.rope_theta = config.rope_theta
-    self.is_causal = True
-    self.attention_dropout = config.attention_dropout
-    self.rope_scaling = config.rope_scaling
-
-    if (self.head_dim * self.num_heads) != self.hidden_size:
-        raise ValueError(
-            f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-            f" and `num_heads`: {self.num_heads})."
-        )
-    self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
-    self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-    self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
-    self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-
-    self.rotary_emb = Qwen2VLRotaryEmbedding(
-        config=config
-    )
 
 
 def retake_Qwen2VLAttention_forward(
@@ -408,173 +363,12 @@ def retake_Qwen2VLFlashAttention2_forward(
     return attn_output, attn_weights, past_key_value
 
 
-def retake_Qwen2VLForConditionalGeneration_prepare_longvideo_prefill(
-    self, 
-    kwargs, 
-    config
-):
-    # Get model input
-    input_ids = kwargs.get("input_ids", None)
-    attention_mask = kwargs.get("attention_mask", None)
-    pixel_values = kwargs.get("pixel_values", None)
-    pixel_values_videos = kwargs.get("pixel_values_videos", None)
-    image_grid_thw = kwargs.get("image_grid_thw", None)
-    video_grid_thw = kwargs.get("video_grid_thw", None)
-
-    # Calculate compression_ratio for dynamic compression
-    if getattr(config, 'longvideo_kwargs', None) and config.longvideo_kwargs.get('kvcache_compression', False):
-        compression_kwargs = config.longvideo_kwargs['kvcache_compression_kwargs']
-        if compression_kwargs.get('dynamic_compression_ratio', False):
-            # Dynamic compression ratio
-            input_length = input_ids.shape[1]
-            max_input_length = compression_kwargs['max_input_length']
-            if input_length <= max_input_length:
-                compression_kwargs['compression_ratio'] = 1
-            else:
-                compression_kwargs['compression_ratio'] = max_input_length / input_length
-            print("input seq length %d, length after compression %.2f" % (input_ids.shape[1], compression_kwargs['compression_ratio']))
-
-    # Prepare prefill inputs
-    cache_position = self._get_initial_cache_position(kwargs["input_ids"], {})["cache_position"]
-    prefill_inputs = dict(
-        input_ids=input_ids.clone(),
-        attention_mask=attention_mask.clone(),
-        past_key_values=None,
-        cache_position=cache_position,
-        pixel_values=pixel_values,
-        pixel_values_videos=pixel_values_videos,
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=video_grid_thw
-    )
-    prefill_inputs = self.prepare_inputs_for_generation(**prefill_inputs)
-
-    # Calculate the number of tokens in each prefill chunk
-    chunk_frames = (
-        config.longvideo_kwargs.get('chunked_prefill_frames', None) if getattr(config, 'longvideo_kwargs', None) 
-        else None
-    )
-    if chunk_frames is None:
-        chunk_prefill_size = None
-    else:
-        T, H, W = prefill_inputs['video_grid_thw'][0]
-        factor = config.vision_config.spatial_merge_size**2 * config.vision_config.temporal_patch_size
-        chunk_prefill_size = chunk_frames * H * W // factor
-    prefill_inputs["chunk_size"] = chunk_prefill_size
-
-    # Check
-    assert prefill_inputs["input_ids"].shape[0] == 1, "batch size > 1 not implemented"
-
-    # Prefill system prompt + visual tokens only
-    video_token_indices = torch.where(prefill_inputs["input_ids"][0] == self.config.video_token_id)[0]
-    s_index, e_index = video_token_indices[0], video_token_indices[-1]
-    prefill_inputs["input_ids"] = prefill_inputs["input_ids"][:,:e_index+1]
-    prefill_inputs["attention_mask"] = prefill_inputs["attention_mask"][:,:e_index+1]
-    prefill_inputs["position_ids"] = prefill_inputs["position_ids"][:,:,:e_index+1]
-    prefill_inputs["past_key_values"] = build_kvcache(config)
-    prefill_inputs["use_cache"] = True
-
-    return prefill_inputs
-
-
-def retake_Qwen2VLForConditionalGeneration_prepare_longvideo_decode(
-    self, 
-    kwargs, 
-    past_key_values, 
-    rope_deltas, 
-    prefill_input_len
-):
-    """Prepare prompt prefill and decode inputs
-    """
-
-    # 1) Truncate input_ids, attention_mask for dummy input
-    prefill_output_len = past_key_values.get_seq_length()
-    prefill_len_diff = prefill_input_len - prefill_output_len
-    kwargs["input_ids"] = kwargs["input_ids"][:,prefill_len_diff:]
-    kwargs["attention_mask"] = kwargs["attention_mask"][:,prefill_len_diff:]
-    # NOTE: `prefill_len_diff` should be aligned with past_key_values.get_seq_length(), because
-    # past_key_values.get_seq_length() + `input_ids[0,:]` -> `cache_position`
-    # `cache_position` -> `input_ids` truncation
-
-    # 2) Change rope_deltas
-    rope_deltas += prefill_len_diff # TODO: Could be moved since we connect position_id in Atten
-
-    kwargs.update({
-        'past_key_values': past_key_values,
-        'use_cache': True,
-        'rope_deltas': rope_deltas,
-        'pixel_values': None,
-        'pixel_values_videos': None,
-        'image_grid_thw': None,
-        'video_grid_thw': None,
-    })
-
-    return kwargs
-
-
-@torch.no_grad()
-def retake_Qwen2VLForConditionalGeneration_generate(
-    self,
-    inputs: Optional[torch.Tensor] = None,
-    generation_config: Optional[GenerationConfig] = None,
-    logits_processor: Optional[LogitsProcessorList] = None,
-    stopping_criteria: Optional[StoppingCriteriaList] = None,
-    prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
-    synced_gpus: Optional[bool] = None,
-    assistant_model: Optional["PreTrainedModel"] = None,
-    streamer: Optional["BaseStreamer"] = None,
-    negative_prompt_ids: Optional[torch.Tensor] = None,
-    negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> Union[GenerateOutput, torch.LongTensor]:
-    original_input_ids = kwargs["input_ids"].clone()
-
-    # Prepare prefill inputs
-    prefill_inputs = self.prepare_longvideo_prefill(kwargs, self.config)
-    rope_deltas = prefill_inputs['rope_deltas'].clone()
-    prefill_input_len = prefill_inputs["input_ids"].shape[-1]
-
-    # Prefill system prompt and visual tokens
-    outputs = self(
-        return_dict=True,
-        **prefill_inputs
-    )
-    past_key_values = outputs.past_key_values
-
-    # Prepare prompt prefill and decode inputs
-    kwargs = self.prepare_longvideo_decode(kwargs, past_key_values, rope_deltas, prefill_input_len)
-    decode_input_len = kwargs["input_ids"].shape[-1]
-    kwargs["past_key_values"].kvcache_compression = False # No KV-Cache compression for decoding stage
-
-    generated_tokens = super(Qwen2VLForConditionalGeneration, self).generate(
-        inputs=inputs,
-        generation_config=generation_config,
-        logits_processor=logits_processor,
-        stopping_criteria=stopping_criteria,
-        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-        synced_gpus=synced_gpus,
-        assistant_model=assistant_model,
-        streamer=streamer,
-        negative_prompt_ids=negative_prompt_ids,
-        negative_prompt_attention_mask=negative_prompt_attention_mask,
-        **kwargs,
-    )
-
-
-    # Compensate for the input_ids truncation
-    new_token_len = generated_tokens.shape[-1] - decode_input_len
-    generated_tokens = torch.cat([
-        original_input_ids,
-        generated_tokens[...,-new_token_len:]
-    ], dim=1)
-
-    return generated_tokens
-
-
 def retake_Qwen2VLForConditionalGeneration_compress_video_tokens(
     self, 
     input_ids: torch.LongTensor = None,
     attention_mask: torch.Tensor = None,
     video_embeds: torch.Tensor = None,
+    cache_position: Optional[torch.LongTensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     labels: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
@@ -619,30 +413,110 @@ def retake_Qwen2VLForConditionalGeneration_compress_video_tokens(
             keypatches_mask = keypatches_mask if return_keyframe_mask else None
         else:
             raise NotImplementedError
-        video_embeds = compressed_memory_bank.flatten(1, 2)
+        video_embeds = compressed_memory_bank.flatten(1, 2)[0]
+        tgt_seq_len = video_embeds.shape[0]
 
         # Reforge the input
         input_ids = torch.cat([
             input_ids[:, :s_index],
-            input_ids[:, s_index:e_index+1][:,:video_embeds.shape[1]],
+            input_ids[:, s_index:e_index+1][:,:tgt_seq_len],
             input_ids[:, e_index+1:]
             ],
             dim=1)
         num_token_diff = ori_seq_len - input_ids.shape[1]
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, num_token_diff:]
+        if num_token_diff and attention_mask is not None:
+            attention_mask = attention_mask[:, :-num_token_diff]
+        if num_token_diff and cache_position is not None:
+            cache_position = cache_position[:-num_token_diff]
         if position_ids is not None:
             position_ids = torch.cat([
                 position_ids[..., :s_index],
-                position_ids[..., s_index:e_index+1][...,:video_embeds.shape[1]],
+                position_ids[..., s_index:e_index+1][...,:tgt_seq_len],
                 position_ids[..., e_index+1:]
                 ],
             dim=2)
-            position_ids[:, :, s_index+video_embeds.shape[1]:] -= num_frame_diff
+            position_ids[:, :, s_index+tgt_seq_len:] -= num_frame_diff
     else:
         keypatches_mask = None
 
-    return input_ids, attention_mask, video_embeds, position_ids, labels, keypatches_mask
+    return input_ids, attention_mask, video_embeds, cache_position, position_ids, labels, keypatches_mask
+
+def retake_Qwen2VLForConditionalGeneration_segment_input_ids(self, input_ids):
+    """Split video and text segments in the input_ids
+    return: list[(s, e, type)], indices of [s, e) are of `type`.
+    """
+    videomask = (input_ids[0] == self.config.video_token_id)
+    # Find the difference between consecutive elements
+    diff = torch.diff(videomask.long())
+    diff_pos_indices = (torch.where(diff == 1)[0] + 1).cpu().numpy()
+    diff_neg_indices = (torch.where(diff == -1)[0] + 1).cpu().numpy()
+
+    # True mask
+    start_indices_true = diff_pos_indices
+    end_indices_true = diff_neg_indices
+    if videomask[0] == True: # segment starts at the beginning
+        start_indices_true = np.insert(start_indices_true, 0, 0)
+    if videomask[-1] == True: # segment ends at the beginning
+        end_indices_true = np.append(end_indices_true, len(videomask))
+
+    # False mask
+    start_indices_flase = diff_neg_indices
+    end_indices_flase = diff_pos_indices
+    if videomask[0] == False:
+        start_indices_flase = np.insert(start_indices_flase, 0, 0)
+    if videomask[-1] == False:
+        end_indices_flase = np.append(end_indices_flase, len(videomask))
+
+    segments = (
+        list(zip(start_indices_true, end_indices_true, ['video']*len(end_indices_true))) + 
+        list(zip(start_indices_flase, end_indices_flase, ['text']*len(end_indices_flase)))
+    )
+    segments = sorted(segments, key=lambda x: x[0])
+    return segments
+
+def retake_Qwen2VLForConditionalGeneration_get_chunk_size(self, config, video_grid_thw) -> int:
+    # Calculate the number of tokens in each prefill chunk
+    chunk_frames = (
+        config.longvideo_kwargs.get('chunked_prefill_frames', None) if getattr(config, 'longvideo_kwargs', None) 
+        else None
+    )
+    if chunk_frames is None:
+        chunk_prefill_size = None
+    else:
+        T, H, W = video_grid_thw[0]
+        t_factor = config.vision_config.spatial_merge_size**2 * config.vision_config.temporal_patch_size
+        chunk_prefill_size = min(chunk_frames, T) * H * W // t_factor
+        chunk_prefill_size = int(chunk_prefill_size.item())
+        # Avoid machine error in ceil() when calculating `num_chunks`.
+    return chunk_prefill_size
+
+def retake_Qwen2VLForConditionalGeneration_forge_input_chunks(self, ss, ee, modality_segments, cache_position, position_ids, attention_mask, past_key_values, inputs_embeds):
+    cache_position_chunk = cache_position[:ee]
+    position_ids_chunk = position_ids[:,:,ss:ee]
+    attention_mask_chunk = attention_mask[:,:ee] # NOTE: specially from 0 to ee
+    inputs_embeds_chunk = inputs_embeds[:,ss:ee]
+    prompt_length = None
+
+    if getattr(self.config, 'longvideo_kwargs', None) and self.config.longvideo_kwargs.get('kvcache_compression', False):
+        compression_kwargs = self.config.longvideo_kwargs['kvcache_compression_kwargs']
+        if compression_kwargs.get('prompt_guided_compression', False) and compression_kwargs.get('compression_ratio', 1) < 1.0:
+            # Prompt guided KV cache compression
+            s_p, e_p, t_p = modality_segments[-1]
+            # NOTE: make sure to include end-of-vision symbol like '<|vision_end|>'(151653)
+            if isinstance(self, Qwen2VLForConditionalGeneration):
+                # QWen2VL automatically satisfies, since only '<|vision_pad|>'(151656) is recognized as vision.
+                pass
+            else:
+                raise NotImplementedError
+            assert t_p == 'text'
+            cache_position_chunk = cache_position[:ee+prompt_length]
+            pos_offset = position_ids[0,0,s_p] - position_ids_chunk[0,0,-1] - 1 # (3, bs, seq_len)
+            position_ids_chunk = torch.cat([position_ids_chunk, position_ids[:,:,s_p:e_p] - pos_offset], dim=2)
+            attention_mask_chunk = torch.cat([attention_mask_chunk, attention_mask[:,s_p:e_p]], dim=1)
+            inputs_embeds_chunk = torch.cat([inputs_embeds_chunk, inputs_embeds[:,s_p:e_p]], dim=1)
+            prompt_length = e_p - s_p
+
+    return cache_position_chunk, position_ids_chunk, attention_mask_chunk, inputs_embeds_chunk, prompt_length
 
 
 def retake_Qwen2VLForConditionalGeneration_forward(
@@ -662,13 +536,57 @@ def retake_Qwen2VLForConditionalGeneration_forward(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     rope_deltas: Optional[torch.LongTensor] = None,
-    chunk_size: Optional[int] = None,
+    cache_position: Optional[torch.LongTensor] = None,
 ) -> Union[Tuple, Qwen2VLCausalLMOutputWithPast]:
+    assert input_ids.shape[0] == 1, "Batch inference of long video is not supported yet!"
+
+    if (cache_position is not None and cache_position[0] == 0): # Prefill
+        is_prefill = True
+        # Calculate chunk size based on inputs
+        chunk_size = self.get_chunk_size(self.config, video_grid_thw)
+        # Configuring KV Cache compression kwargs
+        if getattr(self.config, 'longvideo_kwargs', None) and self.config.longvideo_kwargs.get('kvcache_compression', False):
+            compression_kwargs = self.config.longvideo_kwargs['kvcache_compression_kwargs']
+            if compression_kwargs.get('dynamic_compression_ratio', False):
+                # Dynamic compression ratio
+                input_length = input_ids.shape[1]
+                max_input_length = compression_kwargs['max_input_length']
+                if input_length <= max_input_length:
+                    compression_kwargs['compression_ratio'] = 1
+                else:
+                    compression_kwargs['compression_ratio'] = max_input_length / input_length
+        if chunk_size is not None:
+            modality_segments = self.segment_input_ids(input_ids)
+            past_key_values = build_kvcache(self.config)
+            use_cache = True
+    else:
+        is_prefill = False
+        chunk_size = None
+
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
+    if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+        # calculate RoPE index once per generation in the pre-fill stage only
+        if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
+            position_ids, rope_deltas = self.get_rope_index(
+                input_ids, image_grid_thw, video_grid_thw, attention_mask
+            )
+            self.rope_deltas = rope_deltas
+        # then use the prev pre-calculated rope-deltas to get the correct position ids
+        else:
+            batch_size, seq_length = input_ids.shape
+            delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+            position_ids = torch.arange(seq_length, device=input_ids.device)
+            position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+            if cache_position is not None:  # otherwise `deltas` is an int `0`
+                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+            position_ids = position_ids.add(delta)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
     if inputs_embeds is None:
         # Extract visual features
@@ -698,10 +616,11 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                     )
                 video_embeds = torch.cat(video_embeds)
             # Compression video tokens
-            input_ids, attention_mask, video_embeds, position_ids, labels, keypatches_mask = self.compress_video_tokens(
+            input_ids, attention_mask, video_embeds, cache_position, position_ids, labels, keypatches_mask = self.compress_video_tokens(
                 input_ids=input_ids, 
                 attention_mask=attention_mask, 
                 video_embeds=video_embeds, 
+                cache_position=cache_position,
                 position_ids=position_ids,
                 labels=labels,
                 video_grid_thw=video_grid_thw
@@ -710,22 +629,96 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         # Concat visual and textual features
         inputs_embeds = self.model.embed_tokens(input_ids)
         if pixel_values is not None:
-            image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
+            n_image_features = image_embeds.shape[0]
+            if n_image_tokens != n_image_features:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                )
+            image_mask = (
+                (input_ids == self.config.image_token_id)
+                .unsqueeze(-1)
+                .expand_as(inputs_embeds)
+                .to(inputs_embeds.device)
+            )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         if pixel_values_videos is not None:
-            video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
-            video_mask = video_mask.to(inputs_embeds.device)
+            n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
+            n_video_features = video_embeds.shape[0]
+            if n_video_tokens != n_video_features:
+                raise ValueError(
+                    f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                )
+            video_mask = (
+                (input_ids == self.config.video_token_id)
+                .unsqueeze(-1)
+                .expand_as(inputs_embeds)
+                .to(inputs_embeds.device)
+            )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            if keypatches_mask is not None:
+                keypatches_mask = torch.zeros_like(input_ids).bool().masked_scatter(video_mask[:,:,0], keypatches_mask)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
         if position_ids is not None:
             position_ids = position_ids.to(inputs_embeds.device)
 
-    if chunk_size is None:
+    if is_prefill and chunk_size is not None: # Chunked prefill stage
+        assert past_key_values is not None
+        kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
+        for seg_id, (s, e, dtype) in enumerate(modality_segments):
+            if dtype == 'text': # Prefill text without kvcache_compression
+                past_key_values.kvcache_compression = False
+                outputs = self.model(
+                    input_ids=None,
+                    position_ids=position_ids[:,:,s:e],
+                    attention_mask=attention_mask[:,:e],
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds[:,s:e],
+                    use_cache=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    cache_position=cache_position[:e],
+                )
+                past_key_values = outputs['past_key_values']
+            elif dtype == 'video': # Prefill video may with kvcache_compression
+                num_chunks = math.ceil((e - s) / chunk_size)
+                past_key_values.kvcache_compression = kvcache_compression
+                for idx in tqdm(range(num_chunks), total=num_chunks, desc='Prefilling chunk', disable=not DEBUG_MODE):
+                    ss = s + idx * chunk_size
+                    ee = min(s + (idx + 1) * chunk_size, e)
+                    if keypatches_mask is not None:
+                        past_key_values.keypatches_mask_chunk = keypatches_mask[0,ss:ee]
+                    cache_position_chunk, position_ids_chunk, attention_mask_chunk, inputs_embeds_chunk, prompt_length = self.forge_input_chunks(
+                        ss, ee, modality_segments, cache_position, position_ids, attention_mask, past_key_values, inputs_embeds
+                    )
+                    if hasattr(past_key_values, 'before_forward'):
+                        past_key_values.before_forward(prompt_length=prompt_length)
+                    outputs = self.model(
+                        input_ids=None,
+                        position_ids=position_ids_chunk,
+                        attention_mask=attention_mask_chunk,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds_chunk,
+                        use_cache=True,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                        return_dict=return_dict,
+                        cache_position=cache_position_chunk,
+                    )
+                    past_key_values = outputs['past_key_values']
+                    if hasattr(past_key_values, 'after_forward'):
+                        past_key_values.after_forward()
+                past_key_values.keypatches_mask_chunk = None
+                past_key_values.kvcache_compression = False # Turned off for decoding
+            else:
+                raise ValueError
+    else: # Decode / Standard prefill stage
         outputs = self.model(
             input_ids=None,
             position_ids=position_ids,
@@ -736,66 +729,16 @@ def retake_Qwen2VLForConditionalGeneration_forward(
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
-    else: # Chunk prefilling
-        video_token_indices = torch.where(input_ids[0] == self.config.video_token_id)[0]
-        s_index, e_index = video_token_indices[0], video_token_indices[-1]
-        assert e_index == input_ids.shape[-1] - 1, "Currently, we only support prefilling ends with video tokens"
-        assert past_key_values is not None
-        kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
-
-        # Prefill system prompt without kvcache_compression
-        past_key_values.kvcache_compression = False
-        position_ids_chunk = position_ids[:,:,:s_index]
-        attention_mask_chunk = attention_mask[:,:s_index]
-        inputs_embeds_chunk = inputs_embeds[:,:s_index]
-        outputs = self.model(
-            input_ids=None,
-            position_ids=position_ids_chunk,
-            attention_mask=attention_mask_chunk,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds_chunk,
-            use_cache=True,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-        past_key_values = outputs['past_key_values']
-
-        # Prefill video tokens with kvcache_compression
-        num_chunks = math.ceil((inputs_embeds.shape[1] - s_index) / chunk_size)
-
-        past_key_values.kvcache_compression = kvcache_compression
-        if keypatches_mask is not None:
-            assert keypatches_mask.shape[0] == inputs_embeds.shape[1] - s_index
-        for idx in tqdm(range(num_chunks), total=num_chunks, desc='Prefilling chunk', disable=not DEBUG_MODE):
-            s, e = s_index + idx * chunk_size , s_index + (idx + 1) * chunk_size
-            position_ids_chunk = position_ids[:,:,s:e]
-            attention_mask_chunk = attention_mask[:,:e]
-            inputs_embeds_chunk = inputs_embeds[:,s:e]
-            if keypatches_mask is not None:
-                past_key_values.keypatches_mask_chunk = keypatches_mask[idx * chunk_size:(idx + 1) * chunk_size]
-
-            outputs = self.model(
-                input_ids=None,
-                position_ids=position_ids_chunk,
-                attention_mask=attention_mask_chunk,
-                past_key_values=past_key_values,
-                inputs_embeds=inputs_embeds_chunk,
-                use_cache=True,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-            past_key_values = outputs['past_key_values']
-        past_key_values.keypatches_mask = None
 
     hidden_states = outputs[0]
     logits = self.lm_head(hidden_states)
-    logits = logits.float()
 
     loss = None
     if labels is not None:
+        # Upcast to float if we need to compute the loss to avoid potential precision issues
+        logits = logits.float()
         # Shift so that tokens < n predict n
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -817,5 +760,5 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        rope_deltas=rope_deltas,
+        rope_deltas=self.rope_deltas,
     )

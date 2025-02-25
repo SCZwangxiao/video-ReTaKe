@@ -1,18 +1,18 @@
 import transformers
 
 from retake.qwen2_vl import (
-    retake_Qwen2VLAttention_init,
     retake_Qwen2VLAttention_forward,
     retake_Qwen2VLSdpaAttention_forward,
     retake_Qwen2VLFlashAttention2_forward,
-    retake_Qwen2VLForConditionalGeneration_prepare_longvideo_prefill,
-    retake_Qwen2VLForConditionalGeneration_prepare_longvideo_decode,
-    retake_Qwen2VLForConditionalGeneration_generate,
     retake_Qwen2VLForConditionalGeneration_compress_video_tokens,
+    retake_Qwen2VLForConditionalGeneration_segment_input_ids,
+    retake_Qwen2VLForConditionalGeneration_get_chunk_size,
+    retake_Qwen2VLForConditionalGeneration_forge_input_chunks,
     retake_Qwen2VLForConditionalGeneration_forward,
 )
 from retake.llava_onevision import (
-    retake_Qwen2FlashAttention2_forward,
+    retake_Qwen2Attention_init,
+    retake_Qwen2Attention_forward,
     retake_LlavaOnevisionForConditionalGeneration_get_chunk_size,
     retake_LlavaOnevisionForConditionalGeneration_segment_input_ids,
     retake_LlavaOnevisionForConditionalGeneration_compress_video_tokens,
@@ -52,14 +52,13 @@ def patch_qwen2vl(method):
 
     if method == "retake":
         print("Using ReTaKe for Qwen2VLForConditionalGeneration!")
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLAttention.__init__ = retake_Qwen2VLAttention_init
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLAttention.forward = retake_Qwen2VLAttention_forward
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLSdpaAttention.forward = retake_Qwen2VLSdpaAttention_forward
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLFlashAttention2.forward = retake_Qwen2VLFlashAttention2_forward
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.prepare_longvideo_prefill = retake_Qwen2VLForConditionalGeneration_prepare_longvideo_prefill
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.prepare_longvideo_decode = retake_Qwen2VLForConditionalGeneration_prepare_longvideo_decode
-        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.generate = retake_Qwen2VLForConditionalGeneration_generate
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.compress_video_tokens = retake_Qwen2VLForConditionalGeneration_compress_video_tokens
+        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.segment_input_ids = retake_Qwen2VLForConditionalGeneration_segment_input_ids
+        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.get_chunk_size = retake_Qwen2VLForConditionalGeneration_get_chunk_size
+        transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.forge_input_chunks = retake_Qwen2VLForConditionalGeneration_forge_input_chunks
         transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration.forward = retake_Qwen2VLForConditionalGeneration_forward
     else:
         raise NotImplementedError
@@ -69,7 +68,8 @@ def patch_llava_onevision(method):
 
     if method == "retake":
         print("Using ReTaKe for LlavaOnevisionForConditionalGeneration!")
-        transformers.models.qwen2.modeling_qwen2.Qwen2FlashAttention2.forward = retake_Qwen2FlashAttention2_forward
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.__init__ = retake_Qwen2Attention_init
+        transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = retake_Qwen2Attention_forward
         transformers.models.llava_onevision.modeling_llava_onevision.LlavaOnevisionForConditionalGeneration.get_chunk_size = retake_LlavaOnevisionForConditionalGeneration_get_chunk_size
         transformers.models.llava_onevision.modeling_llava_onevision.LlavaOnevisionForConditionalGeneration.segment_input_ids = retake_LlavaOnevisionForConditionalGeneration_segment_input_ids
         transformers.models.llava_onevision.modeling_llava_onevision.LlavaOnevisionForConditionalGeneration.compress_video_tokens = retake_LlavaOnevisionForConditionalGeneration_compress_video_tokens
