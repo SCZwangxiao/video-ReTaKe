@@ -73,6 +73,7 @@ def retake_Qwen2Attention_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     # Update position_ids if positional embeddings are reforged
+    position_ids = None
     if past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False):
         # This code reforge the `position_ids` of current chunk, 
         # the `position_ids` of previous chunks are reforged in KVCache.update()
