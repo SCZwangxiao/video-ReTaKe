@@ -5,6 +5,7 @@ ReTaKe is a novel approach for long video understanding that reduces temporal an
 ---
 
 ## 📢 Recent Updates
+- **2025/03/11**: Polish the paper, improve the readability of the methods section, and add more ablation studies and results for LongVideoBench.
 - **2025/02/01**: Support for the latest version of Transformers (v4.48).
 - **2025/01/29**: Added support for LLaVA-Video and LLaVA-OneVision.
 
